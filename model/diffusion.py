@@ -11,7 +11,8 @@ import torch
 from einops import rearrange
 
 from model.base import BaseModule
-from torchviz import make_dot
+from collections import defaultdict
+# from torchviz import make_dot
 
 
 class Mish(BaseModule):
@@ -288,6 +289,7 @@ class Diffusion(BaseModule):
                 dxt = dxt * noise_t * h
             xt = (xt - dxt) * mask
         if all_log_probs:
+            # Tranpose to go from N_Timestep, batch to batch, N_Timesteps
             ret_log_probs = torch.stack(ret_log_probs).T
             return xt, ret_log_probs
         return xt
@@ -304,12 +306,12 @@ class Diffusion(BaseModule):
         mu = mu.detach()
         
         advantages = advantages.detach()
+
         base_log_probs = base_log_probs.detach()
 
 
-
+        info = defaultdict(list)
         for i in range(n_timesteps):
-            print(i)
             t = (1.0 - (i + 0.5)*h) * torch.ones(z.shape[0], dtype=z.dtype, 
                                                  device=z.device)
             t = t.detach()
@@ -334,21 +336,24 @@ class Diffusion(BaseModule):
             # mean along all but batch dimension
             log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
             
-            
+            advantages = torch.clamp(advantages, -5, 5)
             ratio = torch.exp(log_prob - base_log_probs[:, i])
             unclipped_loss = -advantages * ratio
             clipped_loss = -advantages * torch.clamp(
                 ratio, 1.0 - clip_range, 1.0 + clip_range
             )
             loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
-            loss = torch.mean(unclipped_loss)
+            
+            info['losses'].append(loss)
+            info['approx_kl'].append(0.5 * torch.mean((log_prob - base_log_probs[:, i]) ** 2))
+            info['clipfrac'].append(torch.mean((torch.abs(ratio - 1.0) > clip_range).float()))
             optimizer.zero_grad()
 
             loss.backward()
             optimizer.step()                
             xt = (xt - dxt) * mask
             xt = xt.detach()
-        return xt
+        return xt, info
 
     @torch.no_grad()
     def forward(self, z, mask, mu, n_timesteps, stoc=False, spk=None, all_log_probs=False):

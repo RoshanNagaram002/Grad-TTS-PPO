@@ -155,7 +155,8 @@ class GradTTS(BaseModule):
         # Sample latent representation from terminal distribution N(mu_y, I)
         z = mu_y + torch.randn_like(mu_y, device=mu_y.device) / temperature
         # Generate sample by performing reverse dynamics
-        self.decoder.reverse_diffusion_ppo(z, y_mask, mu_y, n_timesteps, advantages, base_log_probs, self.optimizer, stoc, spk, clip_range=clip_range)
+        _, info = self.decoder.reverse_diffusion_ppo(z, y_mask, mu_y, n_timesteps, advantages, base_log_probs, self.optimizer, stoc, spk, clip_range=clip_range)
+        return info
         # decoder_outputs = self.decoder.reverse_diffusion_ppo(z, y_mask, mu_y, n_timesteps, advantages, base_log_probs, self.optimizer, stoc, spk, clip_range=clip_range)
         # decoder_outputs = decoder_outputs[:, :, :y_max_length]
 

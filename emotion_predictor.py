@@ -34,13 +34,15 @@ class SuperbPredictor(EmotionPredictor):
         # self.model = Wav2Vec2ForSequenceClassification.from_pretrained("./superb_emotion_predictor")
         # self.feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained("./super_emotion_predictor")
         self.transform = Resample(22050, 16000).to(device)
-
+        
+    @torch.no_grad()
     def predict_emotion(self, wav):
         wav = self.transform(wav)
         inputs = self.feature_extractor(wav, sampling_rate=16000, padding=True, return_tensors="pt")
         logits = self.model(**inputs).logits
         return torch.nn.functional.softmax(logits)
-    
+        
+    @torch.no_grad()
     def predict_emotion_batch(self, wav_batch):
         wav_batch = self.transform(wav_batch)
         inputs = self.feature_extractor(wav_batch.tolist(), sampling_rate=16000, padding=True, return_tensors="pt")

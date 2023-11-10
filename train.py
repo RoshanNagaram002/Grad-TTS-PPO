@@ -67,7 +67,7 @@ clip_range = params.clip_range
 HIFIGAN_CONFIG = './checkpts/hifigan-config.json'
 HIFIGAN_CHECKPT = './checkpts/hifigan.pt'
 N_TIMESTEPS = 50
-
+ANGRY_IDX = 2
 
 with open(HIFIGAN_CONFIG) as f:
     h = AttrDict(json.load(f))
@@ -77,16 +77,22 @@ vocoder.load_state_dict(torch.load(HIFIGAN_CHECKPT, map_location=lambda loc, sto
 _ = vocoder.eval()
 vocoder.remove_weight_norm()
 
+# Keep track of global reward queries
+reward_queries = 0
 
 from emotion_predictor import SuperbPredictor
 from scipy.io.wavfile import write
 emotion_predictor = SuperbPredictor()
 
 def get_rewards(model, x, x_lengths):
+    global reward_queries
     y_enc, y_dec, attn = model(x, x_lengths, n_timesteps=N_TIMESTEPS)
     audio = vocoder.forward(y_dec).squeeze().clamp(-1, 1)
     rewards = emotion_predictor.predict_emotion_batch(audio)
-    rewards = rewards[:, 1].view(-1, 1)
+    rewards = rewards[:, ANGRY_IDX].view(-1, 1)
+    # Update the global number of reward queries
+
+    reward_queries += rewards.shape[0]
     return rewards.to(device)
 
 if __name__ == "__main__":
@@ -112,6 +118,9 @@ if __name__ == "__main__":
     model = GradTTS(nsymbols, 1, None, n_enc_channels, filter_channels, filter_channels_dp, 
                     n_heads, n_enc_layers, enc_kernel, enc_dropout, window_size, 
                     n_feats, dec_dim, beta_min, beta_max, pe_scale, learning_rate).cuda()
+    checkpoint_path = './checkpts/grad-tts.pt'
+    model.load_state_dict(torch.load(checkpoint_path, map_location=lambda loc, storage: loc))
+        
     print('Number of encoder + duration predictor parameters: %.2fm' % (model.encoder.nparams/1e6))
     print('Number of decoder parameters: %.2fm' % (model.decoder.nparams/1e6))
     print('Total parameters: %.2fm' % (model.nparams/1e6))
@@ -124,7 +133,7 @@ if __name__ == "__main__":
     for i, item in enumerate(test_batch):
         mel = item['y']
         logger.add_image(f'image_{i}/ground_truth', plot_tensor(mel.squeeze()),
-                         global_step=0, dataformats='HWC')
+                         global_step=reward_queries, dataformats='HWC')
         save_plot(mel.squeeze(), f'{log_dir}/original_{i}.png')
 
     print('Preprocessing')
@@ -133,37 +142,50 @@ if __name__ == "__main__":
     base_model_all_rewards = []
     with tqdm(loader, total=len(train_dataset)//batch_size) as progress_bar:
         for batch_idx, batch in enumerate(progress_bar):
-            if batch_idx == 1:
-                break
             x, x_lengths = batch['x'].cuda(), batch['x_lengths'].cuda()
             y, y_lengths = batch['y'].cuda(), batch['y_lengths'].cuda()
             _, _, _, base_model_log_probs = model(x, x_lengths, n_timesteps=N_TIMESTEPS, stoc=True, all_log_probs=True)
             base_model_all_log_probs.append(base_model_log_probs)
+            model.eval()
             base_model_all_rewards.append(get_rewards(model, x, x_lengths))
+            model.train()
 
-    all_rewards = torch.cat(base_model_all_rewards)
+    all_rewards = torch.stack(base_model_all_rewards)
+    # Save the preprocessing
+    torch.save(all_rewards, "all_rewards.pt")
     rewards_mean = all_rewards.mean()
     rewards_std = all_rewards.std()
+
+    all_advantages = (all_rewards - rewards_mean) / (rewards_std + 1e-8)
+
+
+    # all_rewards should be batch_indicies, size of batch, 1
+    
     print('Start training...')
     for epoch in range(1, n_epochs + 1):
         model.train()
-        dur_losses = []
-        prior_losses = []
-        diff_losses = []
+        # dur_losses = []
+        # prior_losses = []
+        # diff_losses = []
         with tqdm(loader, total=len(train_dataset)//batch_size) as progress_bar:
             for batch_idx, batch in enumerate(progress_bar):
-                if batch_idx == 1:
-                    break
                 model.zero_grad()
                 x, x_lengths = batch['x'].cuda(), batch['x_lengths'].cuda()
                 y, y_lengths = batch['y'].cuda(), batch['y_lengths'].cuda()
                 
                 base_log_probs =  base_model_all_log_probs[batch_idx]
-                rewards = base_model_all_rewards[batch_idx]
+                advantages = all_advantages[batch_idx]
 
-                advantages = (rewards - rewards_mean) / (rewards_std + 1e-8)
+                
 
-                model.train_ppo(x, x_lengths, N_TIMESTEPS, advantages, clip_range, base_log_probs, stoc=True)
+                info = model.train_ppo(x, x_lengths, N_TIMESTEPS, advantages, clip_range, base_log_probs, stoc=True)
+                mean_loss = torch.mean(info['losses'])
+                mean_approx_kl = torch.mean(info['approx_kl'])
+                mean_clipfrac = torch.mean(info['clipfrac'])
+
+                logger.add_scalar('mean_loss', mean_loss, global_step=reward_queries)
+                logger.add_scalar('mean_approx_kl', mean_approx_kl, global_step=reward_queries)
+                logger.add_scalar('mean_clipfrac', mean_clipfrac, global_step=reward_queries)
 
                 enc_grad_norm = torch.nn.utils.clip_grad_norm_(model.encoder.parameters(),
                                                                max_norm=1)
@@ -171,21 +193,21 @@ if __name__ == "__main__":
                                                                max_norm=1)
 
                 logger.add_scalar('training/encoder_grad_norm', enc_grad_norm,
-                                  global_step=iteration)
+                                  global_step=reward_queries)
                 logger.add_scalar('training/decoder_grad_norm', dec_grad_norm,
-                                  global_step=iteration)
+                                  global_step=reward_queries)
 
                 if batch_idx % 5 == 0:
-                    msg = f'Epoch: {epoch}, iteration: {iteration}'
+                    msg = f'Epoch: {epoch}, Reward queries: {reward_queries}'
                     progress_bar.set_description(msg)
                 
                 iteration += 1
-
-        log_msg = 'Epoch %d: duration loss = %.3f ' % (epoch, np.mean(dur_losses))
-        log_msg += '| prior loss = %.3f ' % np.mean(prior_losses)
-        log_msg += '| diffusion loss = %.3f\n' % np.mean(diff_losses)
-        with open(f'{log_dir}/train.log', 'a') as f:
-            f.write(log_msg)
+        # We are not using these any more?
+        # log_msg = 'Epoch %d: duration loss = %.3f ' % (epoch, np.mean(dur_losses))
+        # log_msg += '| prior loss = %.3f ' % np.mean(prior_losses)
+        # log_msg += '| diffusion loss = %.3f\n' % np.mean(diff_losses)
+        # with open(f'{log_dir}/train.log', 'a') as f:
+        #     f.write(log_msg)
 
         if epoch % params.save_every > 0:
             continue
@@ -193,25 +215,40 @@ if __name__ == "__main__":
         model.eval()
         print('Synthesis...')
         with torch.no_grad():
+            rewards = []
+            # How is this test_batch being set, is it the same as the previous grad-tts?
             for i, item in enumerate(test_batch):
                 x = item['x'].to(torch.long).unsqueeze(0).cuda()
                 x_lengths = torch.LongTensor([x.shape[-1]]).cuda()
                 y_enc, y_dec, attn = model(x, x_lengths, n_timesteps=50)
+
+
                 logger.add_image(f'image_{i}/generated_enc',
                                  plot_tensor(y_enc.squeeze().cpu()),
-                                 global_step=iteration, dataformats='HWC')
+                                 global_step=reward_queries, dataformats='HWC')
                 logger.add_image(f'image_{i}/generated_dec',
                                  plot_tensor(y_dec.squeeze().cpu()),
-                                 global_step=iteration, dataformats='HWC')
+                                 global_step=reward_queries, dataformats='HWC')
                 logger.add_image(f'image_{i}/alignment',
                                  plot_tensor(attn.squeeze().cpu()),
-                                 global_step=iteration, dataformats='HWC')
+                                 global_step=reward_queries, dataformats='HWC')
                 save_plot(y_enc.squeeze().cpu(), 
                           f'{log_dir}/generated_enc_{i}.png')
                 save_plot(y_dec.squeeze().cpu(), 
                           f'{log_dir}/generated_dec_{i}.png')
                 save_plot(attn.squeeze().cpu(), 
                           f'{log_dir}/alignment_{i}.png')
-
+                audio = (vocoder.forward(y_dec).squeeze().clamp(-1, 1))
+                rewards.append(emotion_predictor.predict_emotion(audio))
+        
+        ## Should we keep track of the loss as well?
+        rewards = torch.cat(rewards)
+        print("Logged rewards shape: ", rewards.shape)
+        mean_reward = torch.mean(rewards, dim=0) 
+        logger.add_scalar("neutral_reward", mean_reward[0], global_step=reward_queries)
+        logger.add_scalar("happy_reward", mean_reward[1], global_step=reward_queries)
+        logger.add_scalar("angry_reward", mean_reward[ANGRY_IDX], global_step=reward_queries)
+        logger.add_scalar("sad_reward", mean_reward[3], global_step=reward_queries)
+        print("angry reward: ", mean_reward[ANGRY_IDX])
         ckpt = model.state_dict()
         torch.save(ckpt, f=f"{log_dir}/grad_{epoch}.pt")
