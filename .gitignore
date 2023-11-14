@@ -4,3 +4,6 @@
 /checkpts/
 /superb_emotion_predictor/
 /super_emotion_predictor/
+/ppo_out_1/
+/ppo_out_10/
+all_rewards.pt

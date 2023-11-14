@@ -349,7 +349,11 @@ class Diffusion(BaseModule):
             info['clipfrac'].append(torch.mean((torch.abs(ratio - 1.0) > clip_range).float()))
             optimizer.zero_grad()
 
+
             loss.backward()
+            dec_grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(),
+                                                            max_norm=1)
+            # print("DEC GRAAD NORM", dec_grad_norm)
             optimizer.step()                
             xt = (xt - dxt) * mask
             xt = xt.detach()
